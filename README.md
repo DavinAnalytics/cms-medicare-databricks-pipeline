@@ -49,23 +49,59 @@ Unity Catalog — Governance, lineage, access control
 
 | Notebook | Status | Output |
 |---|---|---|
-| 01_bronze_ingestion | ✅ Complete | 9,781,673 rows → bronze.provider_utilization_raw |
-| 02_silver_transform | 🔄 In Progress | — |
-| 03_gold_aggregation | ⏳ Pending | — |
+| 01_bronze_ingestion | ✅ Complete | 9,781,673 rows → `bronze.provider_utilization_raw` |
+| 02_silver_transform | ✅ Complete | 96,367 providers · 832,539 procedures · 22 quarantined → `silver.*` |
+| 03_gold_aggregation | 🔄 In Progress | — |
 
 ## Unity Catalog Structure
 
 ```
 cms_medicare_databricks_pipeline
   ├── bronze
-  │     └── provider_utilization_raw  ✅
+  │     └── provider_utilization_raw       ✅  9,781,673 rows
   ├── silver
-  │     ├── providers                 ⏳
-  │     └── procedures                ⏳
+  │     ├── providers                      ✅  96,367 unique CA providers
+  │     ├── procedures                     ✅  832,539 clean rows
+  │     └── procedures_quarantine          ✅  22 quarantined rows
   └── gold
-        ├── provider_cost_scorecard   ⏳
-        └── hospital_readmission_risk ⏳
+        ├── provider_cost_scorecard        ⏳
+        └── hospital_readmission_risk      ⏳
 ```
+
+## Key Data Facts
+
+| Metric | Value |
+|---|---|
+| National Medicare rows ingested | 9,781,673 |
+| California rows after filter | 832,561 (8.51% of national) |
+| Unique California providers | 96,367 |
+| Clean procedure rows | 832,539 |
+| Quarantined rows (invalid payment) | 22 (0.003% — excellent quality) |
+| Average procedures per provider | ~8.6 |
+
+## Build Log
+
+**Bronze layer**
+- Downloaded 2024 CMS Medicare Provider Utilization dataset (492MB, ~10M rows)
+- Uploaded CSV to ADLS Gen2 container `cms-medicare-raw/provider_utilization/`
+- Ingested via Auto Loader (cloudFiles) with `trigger(availableNow=True)` to simulate daily batch arrival
+- All 29 columns stored as string — no transformations at bronze layer
+- Added `ingestion_timestamp` and `source_file` metadata columns for audit trail
+- Wrote to Delta table with append-only mode and checkpoint for idempotent re-runs
+- Result: 9,781,673 rows in `bronze.provider_utilization_raw`
+
+**Silver layer**
+- Read from bronze — never from raw ADLS files again
+- Filtered to California providers only (`Rndrng_Prvdr_State_Abrvtn = 'CA'`) — reduced dataset by 91.49%
+- Split into two tables by concern: `providers` (who) and `procedures` (what + cost)
+- Cast all cost columns from string to `decimal(12,2)` for financial precision — chose decimal over double to avoid floating point rounding errors on dollar amounts
+- Cast RUCA codes to `decimal(5,2)` — discovered CMS uses decimal RUCA values (1.1, 2.1 etc.) representing rural-urban gradations
+- Deduplicated providers on NPI — 832K procedure rows collapsed to 96,367 unique providers
+- Deduplicated procedures on `provider_npi + hcpcs_code + place_of_service` — preserves legitimate facility vs office price differences for same procedure
+- Applied data quality checks: null NPI, null HCPCS code, invalid payment amount (≤ 0)
+- 22 records with invalid payment amounts routed to `procedures_quarantine` — not dropped
+- Used `overwriteSchema=true` and `DROP TABLE IF EXISTS` during development to handle schema evolution
+- Result: 96,367 providers · 832,539 clean procedures · 22 quarantined
 
 ## Setup & Reproduction
 
@@ -98,8 +134,8 @@ databricks secrets put-secret cms-medicare-scope adls-storage-key
 ### Step 4 — Run Pipeline
 Execute notebooks in order:
 1. `notebooks/bronze/01_bronze_ingestion.py`
-2. `notebooks/silver/02_silver_transform.py` *(in progress)*
-3. `notebooks/gold/03_gold_aggregation.py` *(pending)*
+2. `notebooks/silver/02_silver_transform.py`
+3. `notebooks/gold/03_gold_aggregation.py` *(in progress)*
 
 ## Author
 

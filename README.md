@@ -17,7 +17,7 @@ CMS Provider CSV → bronze.provider_utilization_raw
 Track 2 — Hospital Readmissions
 CMS Readmissions CSV → bronze.readmissions_raw
                     → silver.readmissions
-                    → gold.hospital_readmission_risk ⏳
+                    → gold.hospital_readmission_risk ✅
 
 Both tracks orchestrated in parallel via Lakeflow Jobs (daily schedule)
 Unity Catalog — Governance, lineage, access control across all layers
@@ -34,7 +34,7 @@ Unity Catalog — Governance, lineage, access control across all layers
 | Ingestion | Auto Loader (cloudFiles) |
 | Language | PySpark + Spark SQL |
 | Governance | Unity Catalog |
-| Orchestration | Lakeflow Jobs (parallel DAG) |
+| Orchestration | Lakeflow Jobs (parallel DAG) ⏳ |
 | CI/CD | Databricks Asset Bundles + GitHub |
 | Secret Management | Databricks Secret Scopes |
 | Performance | Liquid Clustering |
@@ -62,7 +62,8 @@ Unity Catalog — Governance, lineage, access control across all layers
 | 03_gold_aggregation | ✅ Complete | 832,539 rows → `gold.provider_cost_scorecard` |
 | 04_bronze_readmissions | ✅ Complete | 18,330 rows → `bronze.readmissions_raw` |
 | 05_silver_readmissions | ✅ Complete | 1,662 rows · 277 CA hospitals · 6 conditions |
-| 06_gold_readmission_risk | 🔄 In Progress | — |
+| 06_gold_readmission_risk | ✅ Complete | 1,662 rows → `gold.hospital_readmission_risk` |
+| Lakeflow Jobs orchestration | ⏳ Pending | Parallel DAG across both tracks |
 
 ## Unity Catalog Structure
 
@@ -78,7 +79,7 @@ cms_medicare_databricks_pipeline
   │     └── readmissions                   ✅  1,662 rows · 277 CA hospitals
   └── gold
         ├── provider_cost_scorecard        ✅  832,539 rows · liquid clustered
-        └── hospital_readmission_risk      🔄  in progress
+        └── hospital_readmission_risk      ✅  1,662 rows · liquid clustered
 ```
 
 ## Key Data Facts
@@ -93,8 +94,11 @@ cms_medicare_databricks_pipeline
 | Average procedures per provider | ~8.6 |
 | OC high cost outliers identified | 18,678 |
 | Max cost deviation found | +1,473% above state average |
-| CA hospitals in HRRP | 277 unique hospitals |
+| CA hospitals tracked in HRRP | 277 |
 | Conditions tracked | 6 (AMI, CABG, COPD, HF, Hip/Knee, Pneumonia) |
+| High risk hospital-condition pairs | 260 |
+| Low risk hospital-condition pairs | 258 |
+| Average risk hospital-condition pairs | 520 |
 
 ## Key Findings — Provider Cost Scorecard
 
@@ -109,18 +113,25 @@ Top Orange County high-cost outliers identified by the pipeline:
 
 *Cost deviation measured against California IQR benchmark using standardized payment amounts adjusted for geographic cost differences.*
 
-## Key Findings — California Readmission Rates (FY2026)
+## Key Findings — Hospital Readmission Risk (FY2026)
 
 California hospitals ranked by average excess readmission ratio:
 
-| Condition | CA Avg Excess Ratio | Interpretation | Suppressed Hospitals |
+| Condition | CA Avg Excess Ratio | Interpretation | High Risk Hospitals |
 |---|---|---|---|
-| Pneumonia | 1.0262 | 2.62% above expected | 38 |
-| Heart Failure | 1.0171 | 1.71% above expected | 42 |
-| Heart Attack (AMI) | 1.0154 | 1.54% above expected | 136 |
-| CABG | 1.0052 | Essentially at expected | 191 |
-| COPD | 1.0023 | Essentially at expected | 77 |
-| Hip & Knee | 0.9788 | 2.12% BETTER than expected ✅ | 140 |
+| Pneumonia | 1.0262 | 2.62% above expected | included in 260 total |
+| Heart Failure | 1.0171 | 1.71% above expected | 59 high risk |
+| Heart Attack (AMI) | 1.0154 | 1.54% above expected | 35 high risk |
+| CABG | 1.0052 | Essentially at expected | 22 high risk |
+| COPD | 1.0023 | Essentially at expected | 50 high risk |
+| Hip & Knee | 0.9788 | 2.12% BETTER than expected ✅ | — |
+
+Top CA hospitals by AMI (Heart Attack) readmission risk:
+1. Good Samaritan Hospital
+2. Centinela Hospital Medical Center
+3. Washington Hospital
+4. Valley Presbyterian Hospital
+5. Regional Medical Center of San Jose
 
 *Excess readmission ratio > 1.0 = more readmissions than CMS expects = potential Medicare payment penalty.*
 
@@ -161,11 +172,21 @@ California hospitals ranked by average excess readmission ratio:
 **Silver — readmissions**
 - Written entirely in Spark SQL — straightforward enrichment with no complex deduplication logic
 - No storage authentication needed — reading from Unity Catalog Delta tables, not raw ADLS paths
-- Used `TRY_CAST` for all numeric columns — handles 'N/A', 'Too Few to Report', and any other non-numeric CMS suppression values gracefully
-- Used `TO_DATE(col, 'MM/dd/yyyy')` for date columns — CMS uses American date format which `CAST AS DATE` rejects
-- Added `condition_name` column mapping CMS codes to human-readable clinical descriptions
+- Used `TRY_CAST` for all numeric columns — handles 'N/A', 'Too Few to Report' gracefully → NULL
+- Used `TO_DATE(col, 'MM/dd/yyyy')` for dates — CMS uses American date format which CAST AS DATE rejects
+- Added `condition_name` mapping CMS codes to human-readable clinical descriptions
 - Filtered to California only — 18,330 national rows reduced to 1,662 CA rows
-- Result: 1,662 rows · 277 unique CA hospitals · 6 conditions · 1 state
+- Result: 1,662 rows · 277 unique CA hospitals · 6 conditions
+
+**Gold — hospital readmission risk**
+- Written in Spark SQL — two CTEs with RANK() window function
+- Calculated California state-level benchmarks per condition (avg, p25, median, p75)
+- Used IQR classification: High Risk (above p75) / Average Risk / Low Risk (below p25) / Suppressed
+- `RANK() OVER (PARTITION BY measure_name ORDER BY excess_readmission_ratio DESC)` ranks each hospital within its condition
+- `NULLS LAST` ensures suppressed hospitals rank at bottom — not falsely at top
+- LEFT JOIN preserves all hospitals including those with fully suppressed conditions
+- Applied Liquid Clustering on `(condition_name, performance_category)`
+- Result: 1,662 rows · 260 high risk · 258 low risk · 520 average risk hospital-condition pairs
 
 ## Setup & Reproduction
 
@@ -204,7 +225,7 @@ Execute notebooks in order:
 3. `notebooks/gold/03_gold_aggregation.py`
 4. `notebooks/bronze/04_bronze_readmissions.py`
 5. `notebooks/silver/05_silver_readmissions.py`
-6. `notebooks/gold/06_gold_readmission_risk.py` *(in progress)*
+6. `notebooks/gold/06_gold_readmission_risk.py`
 
 ## Author
 

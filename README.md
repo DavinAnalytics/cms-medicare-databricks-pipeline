@@ -19,7 +19,8 @@ CMS Readmissions CSV → bronze.readmissions_raw
                     → silver.readmissions
                     → gold.hospital_readmission_risk ✅
 
-Both tracks orchestrated in parallel via Lakeflow Jobs (daily schedule)
+Both tracks orchestrated in parallel via Lakeflow Jobs
+Trigger: File arrival (Azure Event Grid) → job fires when new CSV lands in ADLS
 Unity Catalog — Governance, lineage, access control across all layers
 ```
 
@@ -34,10 +35,11 @@ Unity Catalog — Governance, lineage, access control across all layers
 | Ingestion | Auto Loader (cloudFiles) |
 | Language | PySpark + Spark SQL |
 | Governance | Unity Catalog |
-| Orchestration | Lakeflow Jobs (parallel DAG) ⏳ |
+| Orchestration | Lakeflow Jobs (parallel DAG, file arrival trigger) |
 | CI/CD | Databricks Asset Bundles + GitHub |
-| Secret Management | Databricks Secret Scopes |
+| Secret Management | Databricks Secret Scopes + Job Cluster Spark Config |
 | Performance | Liquid Clustering |
+| Event Driven | Azure Event Grid + Storage Queue |
 
 ## Datasets
 
@@ -63,7 +65,7 @@ Unity Catalog — Governance, lineage, access control across all layers
 | 04_bronze_readmissions | ✅ Complete | 18,330 rows → `bronze.readmissions_raw` |
 | 05_silver_readmissions | ✅ Complete | 1,662 rows · 277 CA hospitals · 6 conditions |
 | 06_gold_readmission_risk | ✅ Complete | 1,662 rows → `gold.hospital_readmission_risk` |
-| Lakeflow Jobs orchestration | ⏳ Pending | Parallel DAG across both tracks |
+| Lakeflow Jobs orchestration | 🔄 In Progress | Parallel DAG · file arrival trigger |
 
 ## Unity Catalog Structure
 
@@ -142,6 +144,7 @@ Top CA hospitals by AMI (Heart Attack) readmission risk:
 - Ingested via Auto Loader (cloudFiles) with `trigger(availableNow=True)` to simulate daily batch arrival
 - All 29 columns stored as string — no transformations at bronze layer
 - Added `ingestion_timestamp` and `source_file` metadata columns for audit trail
+- Authentication handled at job cluster level via Spark config secret interpolation — no auth code in notebooks
 - Result: 9,781,673 rows in `bronze.provider_utilization_raw`
 
 **Silver — provider utilization**
@@ -167,6 +170,7 @@ Top CA hospitals by AMI (Heart Attack) readmission risk:
 - Downloaded FY2026 CMS Hospital Readmissions Reduction Program dataset (18,330 rows, 12 columns)
 - Column names had spaces — renamed to snake_case at bronze since Delta Lake rejects spaces in column names
 - Verified 100% row fidelity: raw CSV (18,330) = bronze table (18,330) — Match: True ✓
+- Authentication handled at job cluster level — no auth code in notebook
 - Result: 18,330 rows in `bronze.readmissions_raw`
 
 **Silver — readmissions**
@@ -181,12 +185,18 @@ Top CA hospitals by AMI (Heart Attack) readmission risk:
 **Gold — hospital readmission risk**
 - Written in Spark SQL — two CTEs with RANK() window function
 - Calculated California state-level benchmarks per condition (avg, p25, median, p75)
-- Used IQR classification: High Risk (above p75) / Average Risk / Low Risk (below p25) / Suppressed
-- `RANK() OVER (PARTITION BY measure_name ORDER BY excess_readmission_ratio DESC)` ranks each hospital within its condition
-- `NULLS LAST` ensures suppressed hospitals rank at bottom — not falsely at top
+- IQR classification: High Risk (above p75) / Average Risk / Low Risk (below p25) / Suppressed
+- `RANK() OVER (PARTITION BY measure_name ORDER BY excess_readmission_ratio DESC NULLS LAST)`
 - LEFT JOIN preserves all hospitals including those with fully suppressed conditions
 - Applied Liquid Clustering on `(condition_name, performance_category)`
 - Result: 1,662 rows · 260 high risk · 258 low risk · 520 average risk hospital-condition pairs
+
+**Authentication architecture**
+- Development (interactive notebooks): `dbutils.secrets.get()` + `spark.conf.set()` in notebook Cell 1
+- Production (Lakeflow Jobs): ADLS key injected via job cluster Spark config using secret interpolation syntax `{{secrets/cms-medicare-scope/adls-storage-key}}` — no auth code in notebooks
+- Silver and gold notebooks: no authentication needed — Unity Catalog manages access to Delta tables transparently
+- External location registered in Unity Catalog with Azure Event Grid integration for file arrival trigger
+- IAM roles on Access Connector: Storage Blob Data Contributor, Storage Account Contributor, EventGrid EventSubscription Contributor, Storage Queue Data Contributor
 
 ## Setup & Reproduction
 
@@ -200,7 +210,12 @@ Top CA hospitals by AMI (Heart Attack) readmission risk:
 1. Create Azure Databricks workspace (Premium, Hybrid, East US)
 2. Create ADLS Gen2 storage account with hierarchical namespace enabled
 3. Create container `cms-medicare-raw`
-4. Assign `Storage Blob Data Contributor` role to Unity Catalog Access Connector
+4. Assign IAM roles to Unity Catalog Access Connector:
+   - `Storage Blob Data Contributor`
+   - `Storage Account Contributor`
+   - `EventGrid EventSubscription Contributor`
+   - `Storage Queue Data Contributor`
+5. Register `Microsoft.EventGrid` resource provider in Azure subscription
 
 ### Step 2 — Databricks Configuration
 1. Unity Catalog auto-enabled on workspace creation
@@ -212,6 +227,12 @@ databricks secrets create-scope cms-medicare-scope
 databricks secrets put-secret cms-medicare-scope adls-storage-key
 ```
 
+4. Register external location in Unity Catalog pointing to ADLS container
+5. Configure job cluster Spark config for secret interpolation:
+```
+fs.azure.account.key.cmsmedicaredatastorage.dfs.core.windows.net {{secrets/cms-medicare-scope/adls-storage-key}}
+```
+
 ### Step 3 — Data
 1. Download CMS Medicare Provider dataset from data.cms.gov (2024)
 2. Upload CSV to `cms-medicare-raw/provider_utilization/` in ADLS
@@ -219,7 +240,7 @@ databricks secrets put-secret cms-medicare-scope adls-storage-key
 4. Upload CSV to `cms-medicare-raw/readmissions/` in ADLS
 
 ### Step 4 — Run Pipeline
-Execute notebooks in order:
+Execute via Lakeflow Jobs or manually in order:
 1. `notebooks/bronze/01_bronze_ingestion.py`
 2. `notebooks/silver/02_silver_transform.py`
 3. `notebooks/gold/03_gold_aggregation.py`

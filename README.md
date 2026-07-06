@@ -4,7 +4,7 @@ A production-grade batch data pipeline built on Azure Databricks that ingests, t
 
 ## Business Questions Answered
 - Which California providers have the highest cost variation for common procedures?
-- Which Orange County hospitals have the highest readmission risk by condition?
+- Which California hospitals have the highest readmission risk by condition?
 
 ## Architecture
 
@@ -15,8 +15,8 @@ CMS Provider CSV → bronze.provider_utilization_raw
                → gold.provider_cost_scorecard ✅
 
 Track 2 — Hospital Readmissions
-CMS Readmissions CSV → bronze.readmissions_raw ✅
-                    → silver.readmissions ⏳
+CMS Readmissions CSV → bronze.readmissions_raw
+                    → silver.readmissions
                     → gold.hospital_readmission_risk ⏳
 
 Both tracks orchestrated in parallel via Lakeflow Jobs (daily schedule)
@@ -61,8 +61,8 @@ Unity Catalog — Governance, lineage, access control across all layers
 | 02_silver_transform | ✅ Complete | 96,367 providers · 832,539 procedures · 22 quarantined |
 | 03_gold_aggregation | ✅ Complete | 832,539 rows → `gold.provider_cost_scorecard` |
 | 04_bronze_readmissions | ✅ Complete | 18,330 rows → `bronze.readmissions_raw` |
-| 05_silver_readmissions | 🔄 In Progress | — |
-| 06_gold_readmission_risk | ⏳ Pending | — |
+| 05_silver_readmissions | ✅ Complete | 1,662 rows · 277 CA hospitals · 6 conditions |
+| 06_gold_readmission_risk | 🔄 In Progress | — |
 
 ## Unity Catalog Structure
 
@@ -75,10 +75,10 @@ cms_medicare_databricks_pipeline
   │     ├── providers                      ✅  96,367 unique CA providers
   │     ├── procedures                     ✅  832,539 clean rows
   │     ├── procedures_quarantine          ✅  22 quarantined rows
-  │     └── readmissions                   🔄  in progress
+  │     └── readmissions                   ✅  1,662 rows · 277 CA hospitals
   └── gold
         ├── provider_cost_scorecard        ✅  832,539 rows · liquid clustered
-        └── hospital_readmission_risk      ⏳
+        └── hospital_readmission_risk      🔄  in progress
 ```
 
 ## Key Data Facts
@@ -93,7 +93,8 @@ cms_medicare_databricks_pipeline
 | Average procedures per provider | ~8.6 |
 | OC high cost outliers identified | 18,678 |
 | Max cost deviation found | +1,473% above state average |
-| HRRP hospitals tracked nationally | 18,330 rows · FY2026 |
+| CA hospitals in HRRP | 277 unique hospitals |
+| Conditions tracked | 6 (AMI, CABG, COPD, HF, Hip/Knee, Pneumonia) |
 
 ## Key Findings — Provider Cost Scorecard
 
@@ -108,6 +109,21 @@ Top Orange County high-cost outliers identified by the pipeline:
 
 *Cost deviation measured against California IQR benchmark using standardized payment amounts adjusted for geographic cost differences.*
 
+## Key Findings — California Readmission Rates (FY2026)
+
+California hospitals ranked by average excess readmission ratio:
+
+| Condition | CA Avg Excess Ratio | Interpretation | Suppressed Hospitals |
+|---|---|---|---|
+| Pneumonia | 1.0262 | 2.62% above expected | 38 |
+| Heart Failure | 1.0171 | 1.71% above expected | 42 |
+| Heart Attack (AMI) | 1.0154 | 1.54% above expected | 136 |
+| CABG | 1.0052 | Essentially at expected | 191 |
+| COPD | 1.0023 | Essentially at expected | 77 |
+| Hip & Knee | 0.9788 | 2.12% BETTER than expected ✅ | 140 |
+
+*Excess readmission ratio > 1.0 = more readmissions than CMS expects = potential Medicare payment penalty.*
+
 ## Build Log
 
 **Bronze — provider utilization**
@@ -120,10 +136,10 @@ Top Orange County high-cost outliers identified by the pipeline:
 **Silver — provider utilization**
 - Filtered to California providers only — reduced dataset by 91.49%
 - Split into two tables: `providers` (who) and `procedures` (what + cost)
-- Cast cost columns to `decimal(12,2)` — chose decimal over double to avoid floating point rounding errors on dollar amounts
-- Cast RUCA codes to `decimal(5,2)` — CMS uses decimal RUCA values (1.1, 2.1 etc.) representing rural-urban gradations
+- Cast cost columns to `decimal(12,2)` — chose decimal over double to avoid floating point rounding errors
+- Cast RUCA codes to `decimal(5,2)` — CMS uses decimal RUCA values representing rural-urban gradations
 - Deduplicated on `provider_npi + hcpcs_code + place_of_service` — preserves facility vs office price differences
-- Data quality checks routed 22 invalid payment records to quarantine table — not dropped
+- Data quality checks routed 22 invalid payment records to quarantine — not dropped
 - Result: 96,367 providers · 832,539 clean procedures · 22 quarantined
 
 **Gold — provider cost scorecard**
@@ -138,9 +154,18 @@ Top Orange County high-cost outliers identified by the pipeline:
 
 **Bronze — readmissions**
 - Downloaded FY2026 CMS Hospital Readmissions Reduction Program dataset (18,330 rows, 12 columns)
-- Column names had spaces (`Facility Name`, `Number of Discharges` etc.) — renamed to snake_case at bronze ingestion since Delta Lake rejects spaces in column names
-- Verified 100% row fidelity: raw CSV count (18,330) = bronze table count (18,330) — Match: True ✓
+- Column names had spaces — renamed to snake_case at bronze since Delta Lake rejects spaces in column names
+- Verified 100% row fidelity: raw CSV (18,330) = bronze table (18,330) — Match: True ✓
 - Result: 18,330 rows in `bronze.readmissions_raw`
+
+**Silver — readmissions**
+- Written entirely in Spark SQL — straightforward enrichment with no complex deduplication logic
+- No storage authentication needed — reading from Unity Catalog Delta tables, not raw ADLS paths
+- Used `TRY_CAST` for all numeric columns — handles 'N/A', 'Too Few to Report', and any other non-numeric CMS suppression values gracefully
+- Used `TO_DATE(col, 'MM/dd/yyyy')` for date columns — CMS uses American date format which `CAST AS DATE` rejects
+- Added `condition_name` column mapping CMS codes to human-readable clinical descriptions
+- Filtered to California only — 18,330 national rows reduced to 1,662 CA rows
+- Result: 1,662 rows · 277 unique CA hospitals · 6 conditions · 1 state
 
 ## Setup & Reproduction
 
@@ -178,8 +203,8 @@ Execute notebooks in order:
 2. `notebooks/silver/02_silver_transform.py`
 3. `notebooks/gold/03_gold_aggregation.py`
 4. `notebooks/bronze/04_bronze_readmissions.py`
-5. `notebooks/silver/05_silver_readmissions.py` *(in progress)*
-6. `notebooks/gold/06_gold_readmission_risk.py` *(pending)*
+5. `notebooks/silver/05_silver_readmissions.py`
+6. `notebooks/gold/06_gold_readmission_risk.py` *(in progress)*
 
 ## Author
 

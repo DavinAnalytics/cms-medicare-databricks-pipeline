@@ -1,0 +1,28 @@
+# Databricks Asset Bundle local state
+.databricks/
+
+# VS Code extension local overrides (redundant with .databricks/ above, but explicit)
+.databricks/bundle/**/vscode.overrides.json
+.databricks/bundle/**/vscode.bundlevars.json
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Conda / venv
+.venv/
+venv/
+
+# Environment / secrets — never commit these
+.env
+.databrickscfg
+
+# VS Code workspace settings (keep out unless you want to share editor config)
+.vscode/*
+!.vscode/extensions.json
+
+# OS clutter
+.DS_Store
+Thumbs.db

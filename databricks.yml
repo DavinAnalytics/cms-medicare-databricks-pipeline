@@ -1,1 +1,22 @@
+bundle:
+  name: cms-medicare-databricks-pipeline
 
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    default: cms_medicare_databricks_pipeline
+  raw_external_location:
+    default: abfss://cms-medicare-raw@cmsmedicaredatastorage.dfs.core.windows.net
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://<your-workspace-url>.azuredatabricks.net
+  prod:
+    mode: production
+    workspace:
+      host: https://<your-workspace-url>.azuredatabricks.net

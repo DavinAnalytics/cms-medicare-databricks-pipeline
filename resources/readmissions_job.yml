@@ -1,0 +1,21 @@
+resources:
+  jobs:
+    hospital_readmissions_pipeline:
+      name: hospital_readmissions_pipeline
+      trigger:
+        file_arrival:
+          url: ${var.raw_external_location}/readmissions/
+      tasks:
+        - task_key: bronze
+          notebook_task:
+            notebook_path: ../notebooks/bronze/04_bronze_readmissions.ipynb
+        - task_key: silver
+          depends_on:
+            - task_key: bronze
+          notebook_task:
+            notebook_path: ../notebooks/silver/05_silver_readmissions.ipynb
+        - task_key: gold
+          depends_on:
+            - task_key: silver
+          notebook_task:
+            notebook_path: ../notebooks/gold/06_gold_readmission_risk.ipynb

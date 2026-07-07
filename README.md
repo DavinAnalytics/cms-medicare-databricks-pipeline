@@ -20,8 +20,9 @@ CMS Readmissions CSV → bronze.readmissions_raw
                     → gold.hospital_readmission_risk ✅
 
 Both tracks orchestrated in parallel via Lakeflow Jobs
-Trigger: File arrival (Azure Event Grid) → job fires when new CSV lands in ADLS
-Unity Catalog — Governance, lineage, access control across all layers
+Trigger: File arrival (Azure Event Grid, UC-managed file events) → job fires when new CSV lands in ADLS
+Unity Catalog — Governance, lineage, access control across all layers, all compute types
+Compute: 100% Serverless — no classic/dedicated clusters in the deployed pipeline
 ```
 
 ## Tech Stack
@@ -30,42 +31,42 @@ Unity Catalog — Governance, lineage, access control across all layers
 |---|---|
 | Cloud Platform | Microsoft Azure |
 | Data Lake | Azure Data Lake Storage Gen2 |
-| Compute | Azure Databricks (Premium, Hybrid) + Serverless |
+| Compute | Azure Databricks (Premium) — **Serverless only** |
 | Table Format | Delta Lake |
-| Ingestion | Auto Loader (cloudFiles) |
+| Ingestion | Auto Loader (cloudFiles), `Trigger.AvailableNow()` |
 | Language | PySpark + Spark SQL |
-| Governance | Unity Catalog |
-| Orchestration | Lakeflow Jobs (parallel DAG, file arrival trigger) |
+| Governance | Unity Catalog — storage credentials + external locations for all ADLS access |
+| Orchestration | Lakeflow Jobs (parallel DAG, file arrival trigger via UC-managed file events) |
 | CI/CD | Databricks Asset Bundles + GitHub |
-| Secret Management | Databricks Secret Scopes + Job Cluster Spark Config |
+| Cloud Auth | Azure Managed Identity via Access Connector for Azure Databricks — no storage account keys |
 | Performance | Liquid Clustering |
-| Event Driven | Azure Event Grid + Storage Queue |
+| Event Driven | Azure Event Grid + Storage Queue, managed through UC external location file events |
 
 ## Datasets
 
 ### Track 1 — Provider Utilization
-**Source:** CMS Medicare Physician & Other Practitioners by Provider and Service  
-**URL:** https://data.cms.gov/provider-summary-by-type-of-service/medicare-physician-other-practitioners  
-**Size:** ~492MB CSV, 9,781,673 rows, 29 columns  
-**Update frequency:** Annually · **Year:** 2024  
+**Source:** CMS Medicare Physician & Other Practitioners by Provider and Service
+**URL:** https://data.cms.gov/provider-summary-by-type-of-service/medicare-physician-other-practitioners
+**Size:** ~492MB CSV, 9,781,673 rows, 29 columns
+**Update frequency:** Annually · **Year:** 2024
 
 ### Track 2 — Hospital Readmissions
-**Source:** CMS Hospital Readmissions Reduction Program (HRRP)  
-**URL:** https://data.cms.gov/provider-data/dataset/9n3s-kdb3  
-**Size:** ~1MB CSV, 18,330 rows, 12 columns  
-**Update frequency:** Annually · **Year:** FY2026  
+**Source:** CMS Hospital Readmissions Reduction Program (HRRP)
+**URL:** https://data.cms.gov/provider-data/dataset/9n3s-kdb3
+**Size:** ~1MB CSV, 18,330 rows, 12 columns
+**Update frequency:** Annually · **Year:** FY2026
 
 ## Pipeline Status
 
-| Notebook | Status | Output |
-|---|---|---|
-| 01_bronze_ingestion | ✅ Complete | 9,781,673 rows → `bronze.provider_utilization_raw` |
-| 02_silver_transform | ✅ Complete | 96,367 providers · 832,539 procedures · 22 quarantined |
-| 03_gold_aggregation | ✅ Complete | 832,539 rows → `gold.provider_cost_scorecard` |
-| 04_bronze_readmissions | ✅ Complete | 18,330 rows → `bronze.readmissions_raw` |
-| 05_silver_readmissions | ✅ Complete | 1,662 rows · 277 CA hospitals · 6 conditions |
-| 06_gold_readmission_risk | ✅ Complete | 1,662 rows → `gold.hospital_readmission_risk` |
-| Lakeflow Jobs orchestration | 🔄 In Progress | Parallel DAG · file arrival trigger |
+| Notebook | Status | Compute | Output |
+|---|---|---|---|
+| 01_bronze_ingestion | ✅ Complete | Serverless | 9,781,673 rows → `bronze.provider_utilization_raw` |
+| 02_silver_transform | ✅ Complete | Serverless | 96,367 providers · 832,539 procedures · 22 quarantined |
+| 03_gold_aggregation | ✅ Complete | Serverless | 832,539 rows → `gold.provider_cost_scorecard` |
+| 04_bronze_readmissions | ✅ Complete | Serverless | 18,330 rows → `bronze.readmissions_raw` |
+| 05_silver_readmissions | ✅ Complete | Serverless | 1,662 rows · 277 CA hospitals · 6 conditions |
+| 06_gold_readmission_risk | ✅ Complete | Serverless | 1,662 rows → `gold.hospital_readmission_risk` |
+| Lakeflow Jobs orchestration | In progress | Serverless | Two independent jobs, each with its own file arrival trigger |
 
 ## Unity Catalog Structure
 
@@ -137,123 +138,102 @@ Top CA hospitals by AMI (Heart Attack) readmission risk:
 
 *Excess readmission ratio > 1.0 = more readmissions than CMS expects = potential Medicare payment penalty.*
 
-## Build Log
+## Authentication & Governance Architecture (current)
 
-**Bronze — provider utilization**
-- Downloaded 2024 CMS Medicare Provider Utilization dataset (492MB, ~10M rows)
-- Ingested via Auto Loader (cloudFiles) with `trigger(availableNow=True)` to simulate daily batch arrival
-- All 29 columns stored as string — no transformations at bronze layer
-- Added `ingestion_timestamp` and `source_file` metadata columns for audit trail
-- Authentication handled at job cluster level via Spark config secret interpolation — no auth code in notebooks
-- Result: 9,781,673 rows in `bronze.provider_utilization_raw`
+All ADLS access — bronze ingestion included — is governed entirely through **Unity Catalog external locations**, backed by an **Azure Managed Identity** via an **Access Connector for Azure Databricks**. There is no storage account key, secret scope, or `spark.conf`-based authentication anywhere in this pipeline.
 
-**Silver — provider utilization**
-- Filtered to California providers only — reduced dataset by 91.49%
-- Split into two tables: `providers` (who) and `procedures` (what + cost)
-- Cast cost columns to `decimal(12,2)` — chose decimal over double to avoid floating point rounding errors
-- Cast RUCA codes to `decimal(5,2)` — CMS uses decimal RUCA values representing rural-urban gradations
-- Deduplicated on `provider_npi + hcpcs_code + place_of_service` — preserves facility vs office price differences
-- Data quality checks routed 22 invalid payment records to quarantine — not dropped
-- Result: 96,367 providers · 832,539 clean procedures · 22 quarantined
+- **Storage credential**: `cms_medicare_raw_credential` — an Azure Managed Identity, connected through `unity-catalog-access-connector`.
+- **External location**: `cms-medicare-data-storage`, scoped to `abfss://cms-medicare-raw@cmsmedicaredatastorage.dfs.core.windows.net/`, with **file events enabled** for file arrival triggers.
+- **IAM roles granted to the Access Connector's managed identity:**
+  - `Storage Blob Data Contributor` — on the storage account (read/write data)
+  - `Storage Queue Data Contributor` — on the storage account (file event queue operations)
+  - `EventGrid Data Contributor` — on the storage account (managed Event Grid subscription setup)
+  - `EventGrid EventSubscription Contributor` — on the resource group
+  - `Microsoft.EventGrid` resource provider registered on the Azure subscription
+- **Compute**: every notebook — bronze, silver, and gold, for both tracks — runs on **Serverless compute**. Auto Loader in bronze uses `Trigger.AvailableNow()`, which processes everything available since the last checkpoint and exits; this is the exact triggered/incremental streaming pattern Serverless is designed for, so there is no technical reason to keep a warm classic cluster running between file arrivals.
+- Bronze, silver, and gold all authenticate identically — UC vends short-lived credentials automatically the moment code touches a governed `abfss://` path or a UC-managed Delta table. No notebook contains any authentication code.
 
-**Gold — provider cost scorecard**
-- Written in Spark SQL to demonstrate SQL proficiency alongside PySpark
-- Two-CTE query joining silver.procedures + silver.providers + state-wide benchmarks
-- Used `avg_medicare_standardized_amount` for fair geographic comparison across CA regions
-- IQR-based cost outlier classification (High/Normal/Low) — more robust than standard deviation for right-skewed healthcare cost data
-- Orange County flag using zip code prefixes 926xx, 927xx, 928xx
-- Added billing ratio (submitted charge / Medicare payment) to surface aggressive billing patterns
-- Applied Liquid Clustering on `(hcpcs_code, region, cost_outlier)` for adaptive query optimization
-- Result: 832,539 rows · 18,678 OC high cost outliers · max deviation +1,473% above state average
+## What Went Wrong: A Credential Conflict, Not a Data Problem
 
-**Bronze — readmissions**
-- Downloaded FY2026 CMS Hospital Readmissions Reduction Program dataset (18,330 rows, 12 columns)
-- Column names had spaces — renamed to snake_case at bronze since Delta Lake rejects spaces in column names
-- Verified 100% row fidelity: raw CSV (18,330) = bronze table (18,330) — Match: True ✓
-- Authentication handled at job cluster level — no auth code in notebook
-- Result: 18,330 rows in `bronze.readmissions_raw`
+While building each medallion layer individually, bronze ingestion ran using a **storage account key** injected into the job cluster's Spark config via a Databricks secret scope (`fs.azure.account.key.<storage>.dfs.core.windows.net {{secrets/...}}`). This is the legacy, pre-Unity-Catalog way of authenticating to ADLS, and at that point in development it worked — each notebook ran in isolation, and nothing was yet exercising the code path where Unity Catalog's own credential system got involved.
 
-**Silver — readmissions**
-- Written entirely in Spark SQL — straightforward enrichment with no complex deduplication logic
-- No storage authentication needed — reading from Unity Catalog Delta tables, not raw ADLS paths
-- Used `TRY_CAST` for all numeric columns — handles 'N/A', 'Too Few to Report' gracefully → NULL
-- Used `TO_DATE(col, 'MM/dd/yyyy')` for dates — CMS uses American date format which CAST AS DATE rejects
-- Added `condition_name` mapping CMS codes to human-readable clinical descriptions
-- Filtered to California only — 18,330 national rows reduced to 1,662 CA rows
-- Result: 1,662 rows · 277 unique CA hospitals · 6 conditions
+Once I moved from individually testing notebooks to testing orchestration end-to-end, bronze ingestion started throwing:
 
-**Gold — hospital readmission risk**
-- Written in Spark SQL — two CTEs with RANK() window function
-- Calculated California state-level benchmarks per condition (avg, p25, median, p75)
-- IQR classification: High Risk (above p75) / Average Risk / Low Risk (below p25) / Suppressed
-- `RANK() OVER (PARTITION BY measure_name ORDER BY excess_readmission_ratio DESC NULLS LAST)`
-- LEFT JOIN preserves all hospitals including those with fully suppressed conditions
-- Applied Liquid Clustering on `(condition_name, performance_category)`
-- Result: 1,662 rows · 260 high risk · 258 low risk · 520 average risk hospital-condition pairs
+```
+PERMISSION_DENIED: The credential 'cms_medicare_databricks_pipeline' is a workspace
+default credential that is only allowed to access data in the following paths:
+'abfss://unity-catalog-storage@dbstorageu25jgq5vd3tok.dfs.core.windows.net/...'
+```
 
-**Authentication architecture**
-- Development (interactive notebooks): `dbutils.secrets.get()` + `spark.conf.set()` in notebook Cell 1
-- Production (Lakeflow Jobs): ADLS key injected via job cluster Spark config using secret interpolation syntax `{{secrets/cms-medicare-scope/adls-storage-key}}` — no auth code in notebooks
-- Silver and gold notebooks: no authentication needed — Unity Catalog manages access to Delta tables transparently
-- External location registered in Unity Catalog with Azure Event Grid integration for file arrival trigger
-- IAM roles on Access Connector: Storage Blob Data Contributor, Storage Account Contributor, EventGrid EventSubscription Contributor, Storage Queue Data Contributor
+**Root cause:** on Unity-Catalog-enabled compute, every `abfss://` filesystem call is intercepted by UC and resolved through UC's own credential system first — before any legacy `spark.conf` key setting is ever consulted. This is intentional platform behavior: it stops a raw storage key from being used to route around UC's governance, access control, and audit trail. Once orchestration testing exercised a code path where this interception actually fired, UC looked for a governing external location for the raw data path, found none correctly wired to it, and fell back to the catalog's auto-generated default managed-storage credential — which is scoped only to Databricks' own internal storage container, not my ADLS account. The key hadn't broken or expired; it had simply stopped being consulted at all, silently, the moment the right conditions were met.
+
+**The actual mistake:** treating storage-account-key auth and Unity Catalog governance as compatible when they're not — the whole point of external locations is to *replace* the secret-scope-key pattern, not sit alongside it. Silver and gold never hit this because they only ever touched UC-managed Delta tables, never raw ADLS paths directly — which is also why the bug stayed invisible until orchestration specifically exercised bronze's raw storage read.
+
+## How I Debugged It
+
+1. Read the full stack trace rather than just the top-line error — the credential name in the error (`cms_medicare_databricks_pipeline`) matched my catalog name exactly, which was the tell that it was the catalog's auto-generated default credential, not a real storage credential I'd created.
+2. Ran `SHOW STORAGE CREDENTIALS` and `SHOW EXTERNAL LOCATIONS` to see what UC objects actually existed, rather than assuming.
+3. Ran `DESCRIBE EXTERNAL LOCATION` on the external location backing my raw data path and confirmed its `credential_name` pointed at the wrong (default) credential — the external location object existed, but was wired to the wrong authorization source.
+4. Created a dedicated storage credential (`cms_medicare_raw_credential`) backed by my own Access Connector, and repointed the external location at it.
+5. Hit a secondary error trying to swap credentials via the UI (`Cannot update external location... because the external location has dependent managed file event queue`) — resolved by using the Databricks SDK's `force=True` option (`w.external_locations.update(..., force=True)`), which isn't exposed in the Catalog Explorer UI but is available via the API/SDK.
+6. Verified the fix with **Test Connection** in Catalog Explorer (Read/List/Write/Delete/Path Exists/Hierarchical Namespace/File Events Read — all green) before touching the notebook again.
+7. Removed the leftover `spark.conf` key setting from the cluster's Spark config entirely, confirmed **Dedicated access mode**, cleared notebook state/outputs and stale checkpoint paths, and re-ran bronze end-to-end.
+8. Once bronze was confirmed working, tested whether it actually needed Dedicated compute at all — built an isolated test (throwaway checkpoint + throwaway table, same real source path) on **Serverless**, confirmed a full 9.78M-row read/write succeeded, then migrated both bronze notebooks to Serverless permanently.
+
+## What I Learned
+
+- **Legacy auth patterns and Unity Catalog can silently conflict, and UC wins.** If a pipeline is meant to be UC-governed, every storage path needs a proper external location from the start — a storage key sitting alongside UC is a latent bug, not a fallback.
+- **A bug can be invisible until a different execution path exercises it.** Silver and gold looked "done" for the entire time bronze was broken, because they never touched raw ADLS at all. Testing individual notebooks in isolation isn't the same as testing the orchestrated system.
+- **Read the exact object name in a permission error.** The credential name matching my catalog name was the single clue that made the root cause obvious instead of a long guessing exercise.
+- **UI dead ends usually have an API escape hatch.** The `force` option for updating a credential with a dependent file event queue exists on the SDK/API but not in Catalog Explorer's UI — worth checking the CLI/SDK reference whenever a UI action refuses with a "use force" message it doesn't actually let you invoke.
+- **Compute choice should follow workload shape, not habit.** Once bronze was fixed, the deeper question was whether it needed a persistent cluster at all — it didn't, because `Trigger.AvailableNow()` combined with a file-arrival trigger is a triggered/incremental pattern, not a continuously-polling one, and that's exactly what Serverless is built for. Matching compute type to trigger semantics, not just "streaming = needs a cluster," is what actually eliminated the idle-cost problem.
 
 ## Setup & Reproduction
 
 ### Prerequisites
 - Azure subscription (free tier works)
 - Azure Databricks workspace (Premium tier)
-- Azure Data Lake Storage Gen2
+- Azure Data Lake Storage Gen2, hierarchical namespace enabled
 - Databricks CLI installed locally
 
 ### Step 1 — Azure Infrastructure
-1. Create Azure Databricks workspace (Premium, Hybrid, East US)
-2. Create ADLS Gen2 storage account with hierarchical namespace enabled
-3. Create container `cms-medicare-raw`
-4. Assign IAM roles to Unity Catalog Access Connector:
-   - `Storage Blob Data Contributor`
-   - `Storage Account Contributor`
-   - `EventGrid EventSubscription Contributor`
-   - `Storage Queue Data Contributor`
-5. Register `Microsoft.EventGrid` resource provider in Azure subscription
+1. Create Azure Databricks workspace (Premium tier).
+2. Create ADLS Gen2 storage account with hierarchical namespace enabled; create container `cms-medicare-raw`.
+3. Create an **Access Connector for Azure Databricks** (system-assigned managed identity).
+4. Assign the connector's managed identity these IAM roles:
+   - `Storage Blob Data Contributor` — on the storage account
+   - `Storage Queue Data Contributor` — on the storage account
+   - `EventGrid Data Contributor` — on the storage account
+   - `EventGrid EventSubscription Contributor` — on the resource group
+5. Register the `Microsoft.EventGrid` resource provider on the Azure subscription.
 
-### Step 2 — Databricks Configuration
-1. Unity Catalog auto-enabled on workspace creation
-2. Create schemas: `bronze`, `silver`, `gold` in catalog
-3. Set up Databricks secret scope for ADLS authentication:
-
-```bash
-databricks secrets create-scope cms-medicare-scope
-databricks secrets put-secret cms-medicare-scope adls-storage-key
-```
-
-4. Register external location in Unity Catalog pointing to ADLS container
-5. Configure job cluster Spark config for secret interpolation:
-```
-fs.azure.account.key.cmsmedicaredatastorage.dfs.core.windows.net {{secrets/cms-medicare-scope/adls-storage-key}}
-```
+### Step 2 — Unity Catalog Configuration
+1. Confirm the workspace is Unity Catalog enabled (auto-enabled on workspace creation in current Databricks).
+2. Create schemas: `bronze`, `silver`, `gold` in the catalog.
+3. Create a **storage credential** (Catalog → External Data → Credentials) of type Azure Managed Identity, referencing the Access Connector's resource ID from Step 1.
+4. Create an **external location** pointing at `abfss://cms-medicare-raw@<storage-account>.dfs.core.windows.net/`, using that storage credential, with **file events enabled** (Automatic mode).
+5. Grant `READ FILES` / `WRITE FILES` on the external location to the identities that need it.
+6. No secret scopes, no storage keys, no `spark.conf` authentication anywhere.
 
 ### Step 3 — Data
-1. Download CMS Medicare Provider dataset from data.cms.gov (2024)
-2. Upload CSV to `cms-medicare-raw/provider_utilization/` in ADLS
-3. Download CMS HRRP dataset from data.cms.gov (FY2026)
-4. Upload CSV to `cms-medicare-raw/readmissions/` in ADLS
+1. Download the CMS Medicare Provider dataset from data.cms.gov (2024).
+2. Upload the CSV to `cms-medicare-raw/provider_utilization/` in ADLS.
+3. Download the CMS HRRP dataset from data.cms.gov (FY2026).
+4. Upload the CSV to `cms-medicare-raw/readmissions/` in ADLS.
 
-### Step 4 — Run Pipeline
-Execute via Lakeflow Jobs or manually in order:
-1. `notebooks/bronze/01_bronze_ingestion.py`
-2. `notebooks/silver/02_silver_transform.py`
-3. `notebooks/gold/03_gold_aggregation.py`
-4. `notebooks/bronze/04_bronze_readmissions.py`
-5. `notebooks/silver/05_silver_readmissions.py`
-6. `notebooks/gold/06_gold_readmission_risk.py`
+### Step 4 — Deploy and Run
+```bash
+databricks bundle validate
+databricks bundle deploy -t dev
+```
+Both jobs (`provider_utilization_pipeline`, `hospital_readmissions_pipeline`) are defined via Databricks Asset Bundles in `resources/*.yml`, each running entirely on Serverless compute with its own `file_arrival` trigger against the external location. Dropping a new file into either source subpath fires the corresponding job automatically — bronze → silver → gold, end to end.
 
 ## Author
 
-**Davin Kim**  
-Databricks Certified Data Engineer Associate  
+**Davin Kim**
+Databricks Certified Data Engineer Associate
 [LinkedIn](https://www.linkedin.com/in/davinanalytics/) | [GitHub](https://github.com/DavinAnalytics)
 
 ---
-*Built as Portfolio Project 1 of 2 — Batch Pipeline*  
+*Built as Portfolio Project 1 of 2 — Batch Pipeline*
 *Project 2: Real-time Financial Transactions Streaming Pipeline (coming soon)*

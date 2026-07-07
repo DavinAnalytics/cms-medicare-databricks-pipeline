@@ -20,3 +20,4 @@ targets:
     mode: production
     workspace:
       host: https://adb-7405612093495677.17.azuredatabricks.net
+      root_path: /Workspace/Users/davinkim111@gmail.com/.bundle/${bundle.name}/${bundle.target}
